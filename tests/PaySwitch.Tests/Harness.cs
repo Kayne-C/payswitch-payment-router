@@ -21,7 +21,7 @@ namespace PaySwitch.Tests;
 
 public sealed class PostgresFixture : IAsyncLifetime
 {
-    private readonly PostgreSqlContainer _container = new PostgreSqlBuilder("postgres:17").WithCommand("-c", "max_connections=400").Build();
+    private readonly PostgreSqlContainer _container = new PostgreSqlBuilder("public.ecr.aws/docker/library/postgres:17").WithCommand("-c", "max_connections=400").Build();
 
     public async ValueTask InitializeAsync() => await _container.StartAsync();
 
