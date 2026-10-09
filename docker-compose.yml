@@ -1,0 +1,42 @@
+services:
+  postgres:
+    image: postgres:17
+    environment:
+      POSTGRES_USER: payswitch
+      POSTGRES_PASSWORD: payswitch-dev-only
+      POSTGRES_DB: payswitch
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U payswitch"]
+      interval: 3s
+      retries: 20
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+  psp-alpha: &psp
+    build: { context: ., args: { PROJECT: PaySwitch.MockPsp } }
+    environment: { PSP_NAME: alpha }
+    ports: ["5301:8080"]
+
+  psp-beta:
+    <<: *psp
+    environment: { PSP_NAME: beta }
+    ports: ["5302:8080"]
+
+  psp-gamma:
+    <<: *psp
+    environment: { PSP_NAME: gamma }
+    ports: ["5303:8080"]
+
+  api:
+    build: { context: ., args: { PROJECT: PaySwitch.Api } }
+    depends_on:
+      postgres: { condition: service_healthy }
+    ports: ["5200:8080"]
+    environment:
+      ConnectionStrings__Db: Host=postgres;Database=payswitch;Username=payswitch;Password=payswitch-dev-only
+      PaySwitch__Providers__0__BaseUrl: http://psp-alpha:8080
+      PaySwitch__Providers__1__BaseUrl: http://psp-beta:8080
+      PaySwitch__Providers__2__BaseUrl: http://psp-gamma:8080
+
+volumes:
+  pgdata:

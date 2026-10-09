@@ -1,0 +1,9 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/PaySwitch.Api/PaySwitch.Api.csproj" />
+    <Project Path="src/PaySwitch.MockPsp/PaySwitch.MockPsp.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/PaySwitch.Tests/PaySwitch.Tests.csproj" />
+  </Folder>
+</Solution>
