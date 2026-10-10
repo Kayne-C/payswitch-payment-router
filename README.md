@@ -1,112 +1,114 @@
-# PaySwitch — Dayanıklı Ödeme Yönlendirme Motoru
+# PaySwitch — A Resilient Payment Routing Engine
 
-Birden çok ödeme sağlayıcısı (PSP) arasında ödemeyi **en ucuz sağlıklı sağlayıcıya** yönlendiren, sağlayıcı çökse de, yanıt kaybolsa da,
-süreç ortada ölse de **para kaybetmeyen, iki kez çekmeyen, askıda bırakmayan** bir backend. .NET 10, PostgreSQL, Polly.
+**English** · [Türkçe](README.tr.md)
 
-Asıl iddia şu: bir ödeme sisteminin zor kısmı mutlu yol değil, "yanıt gelmedi, ne oldu bilmiyorum" anıdır. Bu repo o anı
-deterministik testlerle ve rastgele hata enjekte eden bir kaos testiyle sınar.
+A backend that routes each payment to the **cheapest healthy provider (PSP)** and does not lose money, charge twice or leave funds on hold, even when a provider is down,
+a response is lost, or the process dies halfway. .NET 10, PostgreSQL, Polly.
 
-## Neler yapıyor
+The core claim: the hard part of a payment system is not the happy path, it is the moment when "no response came and I do not know what happened". This repo tests that moment with
+deterministic tests and with a chaos test that injects random faults.
 
-| Alan | Yaklaşım | Kanıt |
+## What it does
+
+| Area | Approach | Evidence |
 |---|---|---|
-| **Maliyet bazlı yönlendirme** | Tutara göre toplam komisyon (`bps × tutar + sabit`), para birimi desteği, sağlıksız sağlayıcı dışarıda | Birim testler: tutara göre sıralama değişir, eşitlikte ada göre deterministik |
-| **Failover** | Sağlayıcı çökerse sıradakine geçer; reddedilen kart (decline) ise **geçmez** (aynı banka aynı cevabı verir) | Test: alpha kapalı → beta ile tamamlanır; decline'da beta/gamma'ya hiç istek gitmez |
-| **Polly dayanıklılığı** | Her sağlayıcıya özel pipeline: retry (üstel + jitter) → circuit breaker → deneme başına timeout | Test: geçici hata sessizce tekrarlanır; breaker açılınca ölü sağlayıcıya **0 istek**, süre dolunca tek probe ile geri döner |
-| **Saga** | Authorize → capture → defter kaydı. Her karar **eyleme geçmeden önce** veritabanına yazılır; hata olursa telafi (reverse) sırası kalıcı kuyrukta | 8 saga testi: capture kesintisi, deadline, defter hatası, 3 farklı noktada süreç çökmesi |
-| **Sıfır veri kaybı** | Telafi kuyruğu sonsuz tekrar eder; sağlayıcı saatlerce kapalı olsa da müşterinin bloke tutarı sonunda serbest kalır | Test: capture ve reverse aynı anda kapalıyken ödeme `Failed`, sağlayıcı dönünce hold kalkar |
-| **İki kez çekmeme** | Sağlayıcıya giden her işlem ödeme referansıyla idempotent; yanıtı kaybolan istek tekrarlanınca aynı sonucu alır | Test: "işlendi ama yanıt kayboldu" → 2 istek, **1** authorization |
-| **API idempotency** | `Idempotency-Key` + `(merchant, key)` üzerinde veritabanı unique index; aynı anahtar farklı gövdeyle → 422 | Test: 30 eşzamanlı çift tıklama → 1 ödeme, 1 çekim, 1 defter satırı |
-| **Kurtarma** | Takılan ödemeler `NextAttemptAt` (visibility timeout) ile bulunur, veritabanı kirası (lease) ile aynı anda tek işçi sürer | Test: authorize / capture / ledger sonrası çökme → devam ettirilir, çift hold/çekim/kayıt yok |
+| **Cost-based routing** | Total fee for the amount (`bps × amount + fixed`), currency support, unhealthy providers left out | Unit tests: ordering changes with the amount; ties are broken deterministically by name |
+| **Failover** | If a provider is down, the next one is used; a card **decline** does **not** fail over (the same bank would give the same answer) | Test: alpha down → completes via beta; on a decline, no request reaches beta/gamma |
+| **Polly resilience** | A pipeline per provider: retry (exponential + jitter) → circuit breaker → per-attempt timeout | Test: a transient error is retried silently; once the breaker opens, **0 requests** reach the dead provider, and a single probe brings it back after the break |
+| **Saga** | Authorize → capture → ledger entry. Every decision is written to the database **before** acting on it; compensations (reverse) sit in a durable queue | 8 saga tests: capture outage, deadline, ledger failure, process crash at 3 different points |
+| **Zero data loss** | The compensation queue retries forever; even if a provider is down for hours, the customer's hold is eventually released | Test: with capture and reverse both down the payment is `Failed`; when the provider returns the hold is released |
+| **No double charge** | Every provider call is idempotent on the payment reference; a request whose response was lost gets the same result when retried | Test: "processed but the response was lost" → 2 requests, **1** authorization |
+| **API idempotency** | `Idempotency-Key` + a database unique index on `(merchant, key)`; the same key with a different body → 422 | Test: 30 simultaneous double-clicks → 1 payment, 1 charge, 1 ledger row |
+| **Recovery** | Stuck payments are found through `NextAttemptAt` (visibility timeout); a database lease keeps a single worker on a payment | Test: crash after authorize / capture / ledger → resumed, no double hold, charge or entry |
 
-### Kaos testi (asıl kanıt)
+### The chaos test (the main evidence)
 
-300 ödeme, üç sağlayıcı: %25 işlemeden hata, %15 **işledikten sonra yanıtı kaybetme**, defter %25 hata, kartların %10'u reddedilmiş. Test sonunda doğrulananlar:
+300 payments across three providers: 25% errors before processing, 15% **response lost after processing**, 25% ledger failures, 10% of cards declined. At the end the test verifies:
 
-- hiçbir ödeme yarım kalmadı, hiçbir telafi beklemede değil;
-- her `Completed` ödemenin parası **tam bir** sağlayıcıda yakalanmış; `Failed` olanların parası **hiçbir** sağlayıcıda yok, açık hold yok;
-- sağlayıcıların toplam yakalanan tutarı = satılanlar = defterdeki toplam.
+- no payment is left in flight and no compensation is pending;
+- the money of every `Completed` payment is captured at **exactly one** provider; the money of `Failed` payments is at **none**, with no open holds;
+- the providers' total captured amount = what was sold = the ledger total.
 
-Örnek bir koşu (rastgele; her koşuda sayılar biraz değişir, değişmezler değişmez):
+A sample run (random; the numbers vary between runs, the invariants do not):
 
 ```
 payments=300 completed=268 failed=32 (Declined=30, NoProviderAvailable=2)
 provider_requests authorize=449 capture=417 reverse=56
-compensations=38  multi_provider_payments=33 (failover'a düşen)
-captured = ledger = 1.294.476 (minör birim)
+compensations=38  multi_provider_payments=33 (fell through to failover)
+captured = ledger = 1,294,476 (minor units)
 ```
 
-**Bu test gerçek bir hata buldu.** İlk sürümde, bir authorize denemesi sağlayıcıda işlenip yanıtı kaybolduğunda ve bu hata breaker'ı
-açtığında, retry'ın ikinci denemesi `circuit open` ile reddediliyordu. Son hata türü "istek hiç gitmedi" diyordu ama ilk deneme bankaya ulaşmıştı;
-telafi kuyruğa yazılmadığı için müşterinin parası askıda kalıyordu. Düzeltme: belirsiz her authorize hatasında telafi **her zaman** kuyruğa yazılır.
-Deterministik regresyon testi [`ResilienceTests`](tests/PaySwitch.Tests/ResilienceTests.cs) içinde (düzeltme olmadan kırmızı, ile yeşil).
-İkinci hata: Polly breaker'ı `Open → HalfOpen` yalnızca bir çağrı geldiğinde geçirir; yönlendirici "açık" sağlayıcıyı baştan eleyince sağlayıcı asla geri yoklanamıyordu. Bkz. [ADR 0003](docs/adr/0003-polly-pipeline.md).
+**This test found a real bug.** In the first version, when an authorize attempt was processed at the provider but its response was lost, and that very failure opened the breaker,
+the retry's second attempt was rejected with `circuit open`. The final error type said "the request never went out", yet the first attempt had reached the bank, and because no compensation
+was queued the customer's money stayed on hold. The fix: for every uncertain authorize failure a compensation is **always** queued.
+A deterministic regression test lives in [`ResilienceTests`](tests/PaySwitch.Tests/ResilienceTests.cs) (red without the fix, green with it).
+The second bug: Polly moves the breaker `Open → HalfOpen` only when a call arrives, so once the router excluded an "open" provider up front it could never be probed back. See [ADR 0003](docs/adr/en/0003-polly-pipeline.md).
 
-## Hızlı başlangıç
+## Quick start
 
 ```bash
-docker compose up -d --build      # API (5200) + PostgreSQL + 3 sahte sağlayıcı (5301-5303)
+docker compose up -d --build      # API (5200) + PostgreSQL + 3 fake providers (5301-5303)
 
 curl -i localhost:5200/v1/payments -H 'content-type: application/json' \
-  -H 'Idempotency-Key: siparis-1001' -H 'X-Merchant-Id: magaza-1' \
+  -H 'Idempotency-Key: order-1001' -H 'X-Merchant-Id: shop-1' \
   -d '{"amount":12500,"currency":"TRY","paymentMethodToken":"tok_ok"}'
-# 201: state=Completed, provider=alpha (en ucuz). Aynı isteği tekrarla -> 200 + Idempotent-Replayed: true, ikinci çekim yok.
-curl localhost:5200/v1/payments/<id>      # deneme geçmişi ve telafiler dahil
-curl localhost:5200/v1/providers          # circuit breaker durumları
-curl localhost:5200/v1/ops/summary        # durum başına ödeme sayısı, bekleyen telafi
+# 201: state=Completed, provider=alpha (cheapest). Repeat the request -> 200 + Idempotent-Replayed: true, no second charge.
+curl localhost:5200/v1/payments/<id>      # includes attempt history and compensations
+curl localhost:5200/v1/providers          # circuit breaker states
+curl localhost:5200/v1/ops/summary        # payments per state, pending compensations
 ```
 
-Test kartları: `tok_declined` (banka reddi), `tok_insufficient` (yetersiz bakiye).
+Test cards: `tok_declined` (bank decline), `tok_insufficient` (insufficient funds).
 
-### Kendin boz
+### Break it yourself
 
-Sağlayıcılar çalışma anında bozulabilir:
+Providers can be broken at runtime:
 
 ```bash
-curl -X POST localhost:5301/_control -H 'content-type: application/json' -d '{"down":true}'            # alpha çöktü
-curl -X POST localhost:5301/_control -H 'content-type: application/json' -d '{"failOps":["capture"]}'    # yalnız capture bozuk
-curl -X POST localhost:5301/_control -H 'content-type: application/json' -d '{"dropNext":1}'             # sonraki istek işlenir, yanıt kaybolur
+curl -X POST localhost:5301/_control -H 'content-type: application/json' -d '{"down":true}'            # alpha is down
+curl -X POST localhost:5301/_control -H 'content-type: application/json' -d '{"failOps":["capture"]}'    # only capture is broken
+curl -X POST localhost:5301/_control -H 'content-type: application/json' -d '{"dropNext":1}'             # next request is processed, its response is lost
 curl -X POST localhost:5301/_control -H 'content-type: application/json' -d '{"errorRate":0.3,"dropResponseRate":0.1}'
-curl localhost:5301/_stats                                                                                # sağlayıcının gerçekte tuttuğu para
+curl localhost:5301/_stats                                                                                # the money the provider really holds
 ```
 
-Sonra ödeme gönder ve `GET /v1/payments/{id}` ile hangi sağlayıcının denendiğini, hangi telafilerin kuyruğa girdiğini izle.
+Then send a payment and follow it with `GET /v1/payments/{id}` to see which provider was tried and which compensations were queued.
 
-## Durum makinesi
+## State machine
 
 ```
 Created → Authorizing → Authorized → Capturing → Captured → Completed
               │              │            │           │
               └──────────────┴────────────┴───────────┴──→ Failed  (Declined | NoProviderAvailable | CaptureFailed | LedgerFailed)
-                                                               └─ gerekiyorsa: kalıcı telafi kaydı (reverse), sağlayıcı onaylayana kadar tekrarlanır
+                                                               └─ if needed: a durable compensation record (reverse), retried until the provider confirms
 ```
 
-- Geçişler kodda tabloyla zorlanır (`Payment.Transition`); geçersiz geçiş istisna fırlatır.
-- **Write-ahead:** "şu sağlayıcıyı çağıracağım" bilgisi çağrıdan önce yazılır. Çökerse devam eden işlem aynı sağlayıcıya sorar (idempotent), başkasına geçip ikinci hold oluşturmaz.
-- Telafi, onu gerektiren karar ile **aynı veritabanı işleminde** yazılır; "karar verildi ama telafi yazılmadı" aralığı yoktur.
-- Capture'da failover yok: yetki yalnızca authorize edilen sağlayıcıdadır. Orada sabır, süre dolarsa (`CaptureDeadlineSeconds`) telafi vardır. API bu sırada dürüstçe `202 Accepted` döner.
+- Transitions are enforced by a table in code (`Payment.Transition`); an illegal transition throws.
+- **Write-ahead:** "I am about to call this provider" is persisted before the call. After a crash the work resumes by asking the same provider (idempotent) rather than moving to another and creating a second hold.
+- A compensation is written in the **same database transaction** as the decision that requires it, so there is no window of "decided but no compensation recorded".
+- No failover at capture: the authorization lives only at the provider that issued it. There, the system is patient, then after a deadline (`CaptureDeadlineSeconds`) it compensates. Meanwhile the API honestly answers `202 Accepted`.
 
-Kararlar: [docs/adr](docs/adr).
+Decisions: [docs/adr/en](docs/adr/en).
 
-## Testler
+## Tests
 
 ```bash
-dotnet test --solution PaySwitch.slnx      # Docker gerekir (Testcontainers ile gerçek PostgreSQL 17)
+dotnet test --solution PaySwitch.slnx      # needs Docker (real PostgreSQL 17 via Testcontainers)
 ```
 
-29 test: yönlendirme, API ve idempotency, direnç (retry, kayıp yanıt, failover, breaker, hepsi çökük), saga (kesinti, deadline, defter, 3 çökme noktası, yarışan işçiler), kaos.
-Sahte sağlayıcılar gerçek HTTP sunucularıdır (rastgele portta), mock/stub değil. Docker yoksa testler **atlanmaz, başarısız olur**.
-Art arda 5 tam koşu geçti.
+29 tests: routing, API and idempotency, resilience (retry, lost response, failover, breaker, everything down), saga (outage, deadline, ledger, 3 crash points, racing workers), chaos.
+The fake providers are real HTTP servers (on random ports), not mocks or stubs. Without Docker the tests **fail instead of being skipped**.
+Five consecutive full runs passed.
 
-## Bilinen sınırlar (dürüst liste)
+## Known limits (an honest list)
 
-- Sağlayıcılar **simülasyon**. 3-D Secure, webhook'lar, kısmi capture/iade, mutabakat (settlement/reconciliation), chargeback modellenmedi. Gerçek bir PSP ile **denenmedi**.
-- Telafi tek bir `reverse` işlemine dayanır (yetki henüz capture edilmediyse void, edildiyse iade). Bunu tek uçta sunan PSP'ler var (örn. "cancelOrRefund" benzeri), sunmayanlar için ayrı void/refund mantığı gerekir.
-- Defter aynı veritabanında ama arayüz arkasında. "Defter kaydı yazıldı, sonra çöktüm" durumu idempotent kayıtla çözülüyor; defterin kayıt yazdıktan sonra **kalıcı** hata verip iade gerektirmesi (yetim kayıt) modellenmedi.
-- Kaos testi tohumsuz rastgele; bir hatayı birebir tekrar üretmek için tohum yok (bulunan iki hata deterministik testlere çevrildi).
-- Kiralar (lease) ve zamanlayıcılar uygulama saatini kullanır; düğümler arası saat kayması yönetilmiyor. "Yarışan işçiler" testi tek süreçte eşzamanlı çalıştırıcıları dener, ayrı makineleri değil.
-- Şema `EnsureCreated` ile kurulur, EF migration yok. Üretimde CI'dan migration çalıştırılmalı.
-- Yönlendirme yalnızca maliyet + sağlık; başarı oranına, merchant kuralına veya A/B'ye göre yönlendirme yok.
-- Kimlik doğrulama bu serviste yok (önüne [NetRoute](https://github.com/Kayne-C/netroute-api-gateway) gibi bir gateway konur); `X-Merchant-Id` güvenilen başlık olarak okunur. Kart numarası alınmaz, yalnızca token (PCI kapsamı dışı).
-- Telafiler sonsuz tekrar eder ama uyarı/dead-letter mekanizması yok; yalnızca `Attempts` sayacı ve `/v1/ops/summary` var.
-- Yük/performans ölçümü yapılmadı; bu repo doğruluğu ölçer, hızı değil.
+- The providers are a **simulation**. 3-D Secure, webhooks, partial capture/refund, settlement/reconciliation and chargebacks are not modeled. It has **not** been tried against a real PSP.
+- Compensation rests on one `reverse` operation (void if not yet captured, refund if captured). Some PSPs expose this as a single endpoint (a "cancelOrRefund"-style call); others need separate void/refund logic.
+- The ledger lives in the same database but behind an interface. "Ledger entry written, then I crashed" is handled by an idempotent entry; a ledger that fails **permanently** after writing an entry and then requires a refund (an orphan entry) is not modeled.
+- The chaos test is random and unseeded, so a failure cannot be reproduced exactly (the two bugs it found were turned into deterministic tests).
+- Leases and timers use the application clock; clock skew between nodes is not handled. The "racing workers" test runs concurrent runners in one process, not on separate machines.
+- The schema is created with `EnsureCreated`; there are no EF migrations. In production, run migrations from CI.
+- Routing is cost plus health only; no routing by success rate, merchant rules or A/B.
+- This service has no authentication (put a gateway such as [NetRoute](https://github.com/Kayne-C/netroute-api-gateway) in front); `X-Merchant-Id` is read as a trusted header. Card numbers are never accepted, only tokens (outside PCI scope).
+- Compensations retry forever, but there is no alerting or dead-letter mechanism; only the `Attempts` counter and `/v1/ops/summary`.
+- No load or performance measurement was done; this repo measures correctness, not speed.
